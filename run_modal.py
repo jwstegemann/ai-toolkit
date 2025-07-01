@@ -7,10 +7,12 @@ modal run run_modal.py --config-file-list-str=/root/ai-toolkit/config/whatever_y
 '''
 
 import os
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 import sys
+from pathlib import Path
+
 import modal
 from dotenv import load_dotenv
+
 # Load the .env file if it exists
 load_dotenv()
 
@@ -28,31 +30,35 @@ model_volume = modal.Volume.from_name("flux-lora-models", create_if_missing=True
 # modal_output, due to "cannot mount volume on non-empty path" requirement
 MOUNT_DIR = "/root/ai-toolkit/modal_output"  # modal_output, due to "cannot mount volume on non-empty path" requirement
 
+HF_SECRET = modal.Secret.from_name("huggingface")
+HF_CACHE = Path("/models")      # shared HF cache
+DATA_DIR = Path("/data")        # user dataset mount
+
 # define modal app
 image = (
     modal.Image.debian_slim(python_version="3.11")
     # install required system and pip packages, more about this modal approach: https://modal.com/docs/examples/dreambooth_app
-    .apt_install("libgl1", "libglib2.0-0")
+    .apt_install("libgl1", "libglib2.0-0","git")
     .pip_install(
         "python-dotenv",
-        "torch", 
-        "diffusers[torch]", 
-        "transformers", 
-        "ftfy", 
-        "torchvision", 
-        "oyaml", 
-        "opencv-python", 
+        "torch",
+        "git+https://github.com/huggingface/diffusers.git",
+        "transformers",
+        "ftfy",
+        "torchvision",
+        "oyaml",
+        "opencv-python",
         "albumentations",
         "safetensors",
         "lycoris-lora==1.8.3",
         "flatten_json",
         "pyyaml",
-        "tensorboard", 
-        "kornia", 
-        "invisible-watermark", 
-        "einops", 
-        "accelerate", 
-        "toml", 
+        "tensorboard",
+        "kornia",
+        "invisible-watermark",
+        "einops",
+        "accelerate",
+        "toml",
         "pydantic",
         "omegaconf",
         "k-diffusion",
@@ -62,21 +68,34 @@ image = (
         "controlnet_aux==0.0.7",
         "bitsandbytes",
         "hf_transfer",
-        "lpips", 
-        "pytorch_fid", 
-        "optimum-quanto", 
-        "sentencepiece", 
-        "huggingface_hub", 
-        "peft"
+        "lpips",
+        "pytorch_fid",
+        "optimum-quanto",
+        "sentencepiece",
+        "huggingface_hub",
+        "peft",
+        "torchao"
     )
+    .env({
+        "HF_HOME": str(HF_CACHE),
+        "HF_CACHE": str(HF_CACHE),
+        "CUDA_HOME": "/usr/local/cuda-12.8",
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+    })
+    .add_local_dir("/Users/tiberius/src/ai-toolkit", remote_path="/root/ai-toolkit", ignore=["input", "venv", ".git"])
 )
+
+# Volumes
+hf_cache_vol = modal.Volume.from_name("lora-hf-cache", create_if_missing=True)
+data_vol = modal.Volume.from_name("lora-data", create_if_missing=True)
 
 # mount for the entire ai-toolkit directory
 # example: "/Users/username/ai-toolkit" is the local directory, "/root/ai-toolkit" is the remote directory
-code_mount = modal.Mount.from_local_dir("/Users/username/ai-toolkit", remote_path="/root/ai-toolkit")
+# code_mount = modal.Mount.from_local_dir("/Users/username/ai-toolkit", remote_path="/root/ai-toolkit")
 
 # create the Modal app with the necessary mounts and volumes
-app = modal.App(name="flux-lora-training", image=image, mounts=[code_mount], volumes={MOUNT_DIR: model_volume})
+app = modal.App(name="lora-training", image=image, volumes={MOUNT_DIR: model_volume, str(DATA_DIR): data_vol, str(HF_CACHE): hf_cache_vol}, secrets=[HF_SECRET],
+)
 
 # Check if we have DEBUG_TOOLKIT in env
 if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
@@ -85,7 +104,9 @@ if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
     torch.autograd.set_detect_anomaly(True)
 
 import argparse
+
 from toolkit.job import get_job
+
 
 def print_end_message(jobs_completed, jobs_failed):
     failure_string = f"{jobs_failed} failure{'' if jobs_failed == 1 else 's'}" if jobs_failed > 0 else ""
@@ -104,33 +125,42 @@ def print_end_message(jobs_completed, jobs_failed):
 @app.function(
     # request a GPU with at least 24GB VRAM
     # more about modal GPU's: https://modal.com/docs/guide/gpu
-    gpu="A100", # gpu="H100"
+    gpu="A100-80GB", # gpu="H100"
     # more about modal timeouts: https://modal.com/docs/guide/timeouts
     timeout=7200  # 2 hours, increase or decrease if needed
 )
 def main(config_file_list_str: str, recover: bool = False, name: str = None):
+
+    import subprocess
+    subprocess.run(["nvidia-smi"])
+
     # convert the config file list from a string to a list
     config_file_list = config_file_list_str.split(",")
 
     jobs_completed = 0
     jobs_failed = 0
 
+    from huggingface_hub import login
+
+    hf_token = os.environ.get("HUGGINGFACE_TOKEN")
+    login(token=hf_token)
+
     print(f"Running {len(config_file_list)} job{'' if len(config_file_list) == 1 else 's'}")
 
     for config_file in config_file_list:
         try:
             job = get_job(config_file, name)
-            
-            job.config['process'][0]['training_folder'] = MOUNT_DIR
-            os.makedirs(MOUNT_DIR, exist_ok=True)
-            print(f"Training outputs will be saved to: {MOUNT_DIR}")
-            
+
+            #job.config['process'][0]['training_folder'] = MOUNT_DIR
+            #os.makedirs(MOUNT_DIR, exist_ok=True)
+            #print(f"Training outputs will be saved to: {MOUNT_DIR}")
+
             # run the job
             job.run()
-            
+
             # commit the volume after training
             model_volume.commit()
-            
+
             job.cleanup()
             jobs_completed += 1
         except Exception as e:
